@@ -35,7 +35,12 @@ jobs:
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
           CLIPDANCE_API_KEY: ${{ secrets.CLIPDANCE_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: python worker.py
+        run: |
+          if [ -z "$SUPABASE_SERVICE_KEY" ] || [ -z "$CLIPDANCE_API_KEY" ]; then
+            echo "::notice::Secrets not set yet (SUPABASE_SERVICE_KEY, CLIPDANCE_API_KEY); skipping."
+            exit 0
+          fi
+          python worker.py
       # GitHub pauses scheduled workflows on public repos after 60 days with no
       # commits. Once a month, add an empty commit so the schedule keeps running.
       - name: Keep the schedule alive

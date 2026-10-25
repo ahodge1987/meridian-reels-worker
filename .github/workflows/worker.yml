@@ -1,0 +1,50 @@
+name: Reel worker
+
+# Advances every open job in public.reel_jobs by one step (submit, poll,
+# render, upload). Free on a public repo. Secrets are set in the repo's
+# Settings > Secrets and variables > Actions, never committed.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # only for the monthly keep-alive commit below
+
+concurrency:
+  group: reel-worker
+  cancel-in-progress: false
+
+jobs:
+  work:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ffmpeg and dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg
+          pip install -q -r requirements.txt
+      - name: Run worker
+        env:
+          SUPABASE_URL: https://vnoblhczrxfdtumqnkpt.supabase.co
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          CLIPDANCE_API_KEY: ${{ secrets.CLIPDANCE_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python worker.py
+      # GitHub pauses scheduled workflows on public repos after 60 days with no
+      # commits. Once a month, add an empty commit so the schedule keeps running.
+      - name: Keep the schedule alive
+        if: always()
+        run: |
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt $(( 45 * 86400 )) ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "Keep scheduled worker active"
+            git push
+          fi

@@ -33,11 +33,11 @@ jobs:
         env:
           SUPABASE_URL: https://vnoblhczrxfdtumqnkpt.supabase.co
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          CLIPDANCE_API_KEY: ${{ secrets.CLIPDANCE_API_KEY }}
+          RUNWAYML_API_SECRET: ${{ secrets.RUNWAYML_API_SECRET }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          if [ -z "$SUPABASE_SERVICE_KEY" ] || [ -z "$CLIPDANCE_API_KEY" ]; then
-            echo "::notice::Secrets not set yet (SUPABASE_SERVICE_KEY, CLIPDANCE_API_KEY); skipping."
+          if [ -z "$SUPABASE_SERVICE_KEY" ] || [ -z "$RUNWAYML_API_SECRET" ]; then
+            echo "::notice::Secrets not set yet (SUPABASE_SERVICE_KEY, RUNWAYML_API_SECRET); skipping."
             exit 0
           fi
           python worker.py

@@ -3,7 +3,7 @@
 Runs on a schedule (GitHub Actions, every 15 minutes). Each run advances every
 open job in public.reel_jobs (Supabase) by one step:
 
-  queued      -> submit text-to-video to ClipDance (Seedance 2.0)          -> generating
+  queued      -> submit text-to-video to Runway (Seedance 2.0)             -> generating
   generating  -> poll; on success download, trim any model-added hard cut,
                  burn in overlays, loudness-normalise, upload to Supabase   -> ready
                  (or rejected if automated frame QC fails; on a provider
@@ -15,10 +15,10 @@ Instagram via Windsor.ai and marks them 'published'.
 Environment variables (repository secrets, never committed):
   SUPABASE_URL            e.g. https://vnoblhczrxfdtumqnkpt.supabase.co
   SUPABASE_SERVICE_KEY    service-role key (server-side only)
-  CLIPDANCE_API_KEY       ClipDance / Seedance API key
+  RUNWAYML_API_SECRET     Runway developer API secret (dev.runwayml.com)
   ANTHROPIC_API_KEY       optional: enables automated frame QC with Claude vision
   STORAGE_BUCKET          default: social-media
-  MAX_CREDITS_PER_JOB     default: 200 (safety cap)
+  MAX_CREDITS_PER_JOB     default: 400 (safety cap, Runway credits)
 """
 
 from __future__ import annotations
@@ -36,12 +36,17 @@ import requests
 
 SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
-CLIPDANCE_KEY = os.environ["CLIPDANCE_API_KEY"]
+RUNWAY_KEY = os.environ["RUNWAYML_API_SECRET"]
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 BUCKET = os.environ.get("STORAGE_BUCKET", "social-media")
-MAX_CREDITS = int(os.environ.get("MAX_CREDITS_PER_JOB", "200"))
+MAX_CREDITS = int(os.environ.get("MAX_CREDITS_PER_JOB", "400"))
 
-CLIPDANCE = "https://clipdance.ai/api/v1"
+RUNWAY = "https://api.dev.runwayml.com/v1"
+# reel_jobs.model value -> (Runway model id, credits per second from the Runway model list)
+RUNWAY_MODELS = {
+    "seedance-2.0": ("seedance2", 30),
+    "seedance-2.0-fast": ("seedance2_fast", 24),
+}
 FONTS = Path(__file__).parent / "fonts"
 EXTRABOLD = FONTS / "Montserrat-ExtraBold.ttf"
 SEMIBOLD = FONTS / "Montserrat-SemiBold.ttf"
@@ -98,61 +103,74 @@ def upload(path: Path, name: str, content_type: str) -> str:
     return f"{SUPABASE_URL}/storage/v1/object/public/{BUCKET}/{name}"
 
 
-# ---------------------------------------------------------------- clipdance
-def cd_headers() -> dict:
-    return {"Authorization": f"Bearer {CLIPDANCE_KEY}", "Content-Type": "application/json"}
+# ---------------------------------------------------------------- runway
+def rw_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {RUNWAY_KEY}",
+        "X-Runway-Version": "2024-11-06",
+        "Content-Type": "application/json",
+    }
 
 
 def submit(job: dict) -> None:
-    # API pricing: seedance-2.0 is 16 credits/s at 720p.
-    est = 16 * job["duration_s"] if job["model"] == "seedance-2.0" else 12 * job["duration_s"]
+    if job["model"] not in RUNWAY_MODELS:
+        update(job["id"], status="failed", error=f"unknown model {job['model']!r} (expected one of {sorted(RUNWAY_MODELS)})")
+        return
+    model, rate = RUNWAY_MODELS[job["model"]]
+    est = rate * job["duration_s"]
     if est > MAX_CREDITS:
         update(job["id"], status="failed", error=f"estimated {est} credits exceeds cap {MAX_CREDITS}")
         return
     body = {
-        "model": job["model"],
-        "type": "text-to-video",
-        "prompt": job["video_prompt"],
+        "model": model,
+        "promptText": job["video_prompt"][:3500],
         "duration": job["duration_s"],
-        "resolution": "720p",
-        "aspect_ratio": "9:16",
-        "enable_audio": True,
+        "ratio": "1080:1920" if model == "seedance2" else "720:1280",
+        "audio": True,
     }
-    r = requests.post(f"{CLIPDANCE}/video/generate", headers=cd_headers(), json=body, timeout=60)
-    if r.status_code == 402:
-        update(job["id"], status="failed", error="ClipDance: insufficient credits")
-        return
-    r.raise_for_status()
+    r = requests.post(f"{RUNWAY}/text_to_video", headers=rw_headers(), json=body, timeout=60)
+    if r.status_code >= 400:
+        detail = r.text[:500]
+        if "credit" in detail.lower():
+            update(job["id"], status="failed", error=f"Runway: insufficient credits ({detail})")
+            return
+        if r.status_code in (400, 401):
+            update(job["id"], status="failed", error=f"Runway HTTP {r.status_code}: {detail}")
+            return
+        r.raise_for_status()
     data = r.json()
     update(
         job["id"],
         status="generating",
         provider_task_id=data["id"],
-        credits_charged=data.get("credits_charged"),
+        credits_charged=est,
         attempts=job["attempts"] + 1,
         error=None,
     )
-    log(f"{job['id']}: submitted {data['id']} ({data.get('credits_charged')} credits)")
+    log(f"{job['id']}: submitted Runway task {data['id']} (~{est} credits)")
 
 
 def poll(job: dict) -> None:
-    r = requests.get(f"{CLIPDANCE}/video/task/{job['provider_task_id']}", headers=cd_headers(), timeout=60)
+    r = requests.get(f"{RUNWAY}/tasks/{job['provider_task_id']}", headers=rw_headers(), timeout=60)
     r.raise_for_status()
     data = r.json()
     status = data.get("status")
-    if status in ("queued", "running", "processing", "pending"):
+    if status in ("PENDING", "THROTTLED", "RUNNING"):
         log(f"{job['id']}: still {status}")
         return
-    if status != "succeeded":
-        err = f"ClipDance task {status}: {data.get('error') or data}"
-        if job["attempts"] < 2:
+    if status != "SUCCEEDED" or not data.get("output"):
+        err = f"Runway task {status}: {data.get('failureCode')} {data.get('failure') or ''}".strip()
+        # Content moderation is not worth retrying with the same prompt.
+        moderated = "SAFETY" in str(data.get("failureCode", "")).upper()
+        if job["attempts"] < 2 and not moderated:
             update(job["id"], status="queued", provider_task_id=None, error=err)
         else:
             update(job["id"], status="failed", error=err)
         log(f"{job['id']}: {err}")
         return
-    update(job["id"], status="rendering", raw_url=data["video_url"])
-    render(job | {"raw_url": data["video_url"]})
+    video_url = data["output"][0]
+    update(job["id"], status="rendering", raw_url=video_url)
+    render(job | {"raw_url": video_url})
 
 
 # ---------------------------------------------------------------- rendering
@@ -215,7 +233,7 @@ def overlay_filter(job: dict, workdir: Path, end: float) -> str:
             f"drawtext=fontfile={font}:textfile={workdir / fname}:fontsize={size}:fontcolor=white:"
             f"{border}:shadowcolor=black@0.7:x=(w-text_w)/2:y={y}:alpha='{alpha(start)}'"
         )
-    # 720p source -> 1080x1920 with high-quality scaling, then text on top (text renders at full resolution).
+    # Source (1080p or 720p) -> 1080x1920 with high-quality scaling, then text on top (text renders at full resolution).
     return "scale=1080:1920:flags=lanczos," + ",".join(parts)
 
 

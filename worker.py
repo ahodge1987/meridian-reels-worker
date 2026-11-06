@@ -205,6 +205,20 @@ def esc(text: str) -> str:
     return text.replace("'", "’")  # apostrophes are typographic only
 
 
+MAX_TEXT_W = 1080 * 0.88  # keep every overlay line inside the frame with a side margin
+
+
+def fit_size(text: str, font: Path, size: int, max_w: float = MAX_TEXT_W) -> int:
+    """Largest font size <= size at which `text` fits within max_w pixels."""
+    try:
+        from PIL import ImageFont
+    except ImportError:  # rough fallback: ~0.6 em per character
+        return max(28, min(size, int(max_w / (0.6 * max(len(text), 1)))))
+    while size > 28 and ImageFont.truetype(str(font), size).getlength(text) > max_w:
+        size -= 2
+    return size
+
+
 def overlay_filter(job: dict, workdir: Path, end: float) -> str:
     """Upscale to 1080x1920, then draw the overlays directly on the footage.
 
@@ -228,7 +242,9 @@ def overlay_filter(job: dict, workdir: Path, end: float) -> str:
 
     parts = []
     for fname, text, font, size, y, kind in lines:
-        (workdir / fname).write_text(esc(text), encoding="utf-8")
+        text = esc(text)
+        size = fit_size(text, font, size)
+        (workdir / fname).write_text(text, encoding="utf-8")
         border = "borderw=3:bordercolor=black@0.85:shadowx=5:shadowy=5" if kind == "title" and size > 60 else \
                  "borderw=2:bordercolor=black@0.6:shadowx=4:shadowy=4"
         start = 0.5 if kind == "title" else 0.9

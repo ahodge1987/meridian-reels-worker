@@ -3,7 +3,7 @@
 Runs on a schedule (GitHub Actions, every 15 minutes). Each run advances every
 open job in public.reel_jobs (Supabase) by one step:
 
-  queued      -> submit text-to-video to Runway (Seedance 2.0)             -> generating
+  queued      -> submit text-to-video to Runway (Kling 3.0 Pro by default)  -> generating
   generating  -> poll; on success download, trim any model-added hard cut,
                  burn in overlays, loudness-normalise, upload to Supabase   -> ready
                  (or rejected if automated frame QC fails; on a provider
@@ -42,10 +42,13 @@ BUCKET = os.environ.get("STORAGE_BUCKET", "social-media")
 MAX_CREDITS = int(os.environ.get("MAX_CREDITS_PER_JOB", "400"))
 
 RUNWAY = "https://api.dev.runwayml.com/v1"
-# reel_jobs.model value -> (Runway model id, credits per second from the Runway model list)
+# reel_jobs.model value -> (Runway model id, credits per second at the ratio used, output ratio)
+# Seedance 2.0's provider moderation blocked real-destination landscapes (SAFETY.OUTPUT.THIRD_PARTY),
+# so Kling 3.0 Pro is the default for new jobs.
 RUNWAY_MODELS = {
-    "seedance-2.0": ("seedance2", 30),
-    "seedance-2.0-fast": ("seedance2_fast", 24),
+    "kling-3.0-pro": ("kling3.0_pro", 12, "1080:1920"),
+    "seedance-2.0": ("seedance2", 40, "1080:1920"),
+    "seedance-2.0-fast": ("seedance2_fast", 24, "720:1280"),
 }
 FONTS = Path(__file__).parent / "fonts"
 EXTRABOLD = FONTS / "Montserrat-ExtraBold.ttf"
@@ -116,16 +119,16 @@ def submit(job: dict) -> None:
     if job["model"] not in RUNWAY_MODELS:
         update(job["id"], status="failed", error=f"unknown model {job['model']!r} (expected one of {sorted(RUNWAY_MODELS)})")
         return
-    model, rate = RUNWAY_MODELS[job["model"]]
+    model, rate, ratio = RUNWAY_MODELS[job["model"]]
     est = rate * job["duration_s"]
     if est > MAX_CREDITS:
         update(job["id"], status="failed", error=f"estimated {est} credits exceeds cap {MAX_CREDITS}")
         return
     body = {
         "model": model,
-        "promptText": job["video_prompt"][:3500],
+        "promptText": job["video_prompt"][:2500 if model.startswith("kling") else 3500],
         "duration": job["duration_s"],
-        "ratio": "1080:1920" if model == "seedance2" else "720:1280",
+        "ratio": ratio,
         "audio": True,
     }
     r = requests.post(f"{RUNWAY}/text_to_video", headers=rw_headers(), json=body, timeout=60)
